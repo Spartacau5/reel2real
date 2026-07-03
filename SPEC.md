@@ -1,4 +1,4 @@
-# SPEC — "Send to Agent" v1
+# SPEC — "Reel to Real" v1
 Instagram post → screenshot → structured action (calendar event / reminder) with zero manual typing.
 
 ## Overview
