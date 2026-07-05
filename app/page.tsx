@@ -200,12 +200,20 @@ export default function Home() {
   const [cards, setCards] = useState<Card[]>([]);
   const [processing, setProcessing] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  // The resolved post, shown as a preview the moment /api/resolve returns —
+  // before extraction finishes — so the user sees "it caught my post" fast.
+  const [preview, setPreview] = useState<{
+    thumbnail?: string;
+    author_handle?: string;
+    caption?: string;
+  } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const setResult = useCallback((r: ExtractResponse) => {
     setSummary(r.post_summary);
     setConfidence(r.confidence);
     setCards(r.items.map((it, i) => fromItem(it, i)));
+    setPreview(null); // real cards replace the preview + skeletons
     setStage("results");
   }, []);
 
@@ -244,6 +252,7 @@ export default function Home() {
       if (!target) return;
       setProcessing(target);
       setCards([]);
+      setPreview(null);
       setError(null);
       setStage("resolving");
       try {
@@ -258,6 +267,15 @@ export default function Home() {
           return;
         }
         const resolved = (await res.json()) as ResolveResult;
+        // Render the resolved post immediately — extraction continues below.
+        const thumb = resolved.images?.[0];
+        setPreview({
+          thumbnail: thumb
+            ? `data:${thumb.media_type};base64,${thumb.data}`
+            : undefined,
+          author_handle: resolved.author_handle,
+          caption: resolved.caption,
+        });
         await runExtract({
           caption: resolved.caption,
           images: resolved.images,
@@ -276,7 +294,9 @@ export default function Home() {
   const onScreenshot = useCallback(
     async (file: File) => {
       setProcessing("your screenshot");
+      setCards([]);
       const img = await downscaleClient(file);
+      setPreview({ thumbnail: `data:${img.media_type};base64,${img.data}` });
       await runExtract({ image: img.data, media_type: img.media_type });
     },
     [runExtract],
@@ -310,6 +330,10 @@ export default function Home() {
 
   return (
     <main style={{ maxWidth: 560, margin: "0 auto", padding: "1.75rem 1rem 4rem" }}>
+      <style>{`
+        .sk{background:#ececec;border-radius:6px;animation:r2rpulse 1.2s ease-in-out infinite}
+        @keyframes r2rpulse{0%,100%{opacity:1}50%{opacity:.45}}
+      `}</style>
       <h1 style={{ margin: "0 0 0.15rem", fontSize: "1.4rem" }}>Send to Agent</h1>
       <p style={{ color: "#666", marginTop: 0, fontSize: "0.9rem" }}>
         Paste an Instagram/TikTok link — get a calendar event, no typing.
@@ -350,18 +374,21 @@ export default function Home() {
         </button>
       </form>
 
-      {/* Progress — distinct per stage */}
+      {/* Stage 1: resolving the link (no preview yet). */}
       {stage === "resolving" && (
         <Progress
           title="Resolving link…"
           detail={`Fetching the post${processing ? ` — ${short(processing)}` : ""}. This can take a moment.`}
         />
       )}
+
+      {/* Stage 2: post caught → show the resolved preview + skeleton cards while
+          /api/extract runs. The user sees "it caught my post" within ~3s. */}
       {stage === "extracting" && (
-        <Progress
-          title="Reading the post…"
-          detail="Pulling out dates, places, and reminders (usually 5–10s)."
-        />
+        <section style={{ marginTop: "1rem" }}>
+          {preview && <ResolvedPreview {...preview} />}
+          <SkeletonCards count={2} />
+        </section>
       )}
 
       {/* Error with fallback emphasis */}
@@ -475,6 +502,88 @@ function Progress({ title, detail }: { title: string; detail: string }) {
       <div style={{ fontWeight: 600 }}>{title}</div>
       <div style={{ color: "#555", fontSize: "0.88rem", marginTop: 2 }}>{detail}</div>
     </div>
+  );
+}
+
+// The resolved post, shown the instant /api/resolve returns — "it caught my post".
+function ResolvedPreview({
+  thumbnail,
+  author_handle,
+  caption,
+}: {
+  thumbnail?: string;
+  author_handle?: string;
+  caption?: string;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 12,
+        padding: "0.85rem",
+        border: "1px solid #d8ecdc",
+        background: "#f3fbf5",
+        borderRadius: 12,
+      }}
+    >
+      {thumbnail ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={thumbnail}
+          alt=""
+          style={{
+            width: 60,
+            height: 60,
+            objectFit: "cover",
+            borderRadius: 8,
+            flexShrink: 0,
+          }}
+        />
+      ) : (
+        <div className="sk" style={{ width: 60, height: 60, flexShrink: 0 }} />
+      )}
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+          ✓ Got it{author_handle ? ` — ${author_handle}` : ""}
+          <span style={{ color: "#3a8", fontWeight: 500 }}> · reading the post…</span>
+        </div>
+        {caption && (
+          <div
+            style={{
+              fontSize: "0.8rem",
+              color: "#556",
+              marginTop: 4,
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+            }}
+          >
+            {caption}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Placeholder cards shown while extraction runs.
+function SkeletonCards({ count }: { count: number }) {
+  return (
+    <>
+      {Array.from({ length: count }).map((_, i) => (
+        <div key={i} style={{ ...card, marginTop: "0.85rem" }}>
+          <div className="sk" style={{ height: 12, width: "22%" }} />
+          <div className="sk" style={{ height: 16, width: "70%", marginTop: 10 }} />
+          <div className="sk" style={{ height: 12, width: "45%", marginTop: 10 }} />
+          <div className="sk" style={{ height: 12, width: "85%", marginTop: 10 }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+            <div className="sk" style={{ height: 38, flex: 1 }} />
+            <div className="sk" style={{ height: 38, flex: 1 }} />
+          </div>
+        </div>
+      ))}
+    </>
   );
 }
 
