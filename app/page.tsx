@@ -1,12 +1,9 @@
 "use client";
 
-// Single-page "Send to Agent" UI (SPEC.md → User Flow / Frontend requirements).
-// Mobile-first, iPhone Safari primary.
-//
-// Flow:  ?url= auto-submit → RESOLVE (/api/resolve) → EXTRACT (/api/extract)
-//        → editable review cards → .ics download / Google Calendar link.
-// Fallback: paste / upload / drag-drop a screenshot at any time.
-// States: idle(empty) · resolving · extracting · results · error-with-fallback.
+// Reel2Real — single page, mobile-first (iPhone Safari primary).
+// Flow: ?url= auto-submit → RESOLVE → EXTRACT → editable review cards →
+// .ics / Google Calendar. Fallback: paste / upload / drag a screenshot.
+// All visual tokens live in app/globals.css (the design system).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExtractResponse, Item } from "@/lib/types";
@@ -74,8 +71,7 @@ async function downscaleClient(
     if (!ctx) throw new Error("no canvas context");
     ctx.drawImage(img, 0, 0, w, h);
     const type = file.type === "image/png" ? "image/png" : "image/jpeg";
-    const dataUrl = canvas.toDataURL(type, 0.9);
-    return { data: dataUrl.split(",")[1], media_type: type };
+    return { data: canvas.toDataURL(type, 0.9).split(",")[1], media_type: type };
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -92,14 +88,14 @@ interface Card {
   allDay: boolean;
   isDateRange: boolean;
   dateStart: string; // YYYY-MM-DD
-  dateEnd: string; // YYYY-MM-DD (range end, inclusive)
+  dateEnd: string;
   timeStart: string; // YYYY-MM-DDTHH:MM
-  timeEnd: string; // YYYY-MM-DDTHH:MM
-  reminderLocal: string; // YYYY-MM-DDTHH:MM
+  timeEnd: string;
+  reminderLocal: string;
   reminderLabel: string;
   offset: string;
   dateless: boolean;
-  skip: boolean; // dateless: reminder-only, no calendar add
+  skip: boolean;
   past: boolean;
   unreadable: boolean;
   resolved_address: string | null;
@@ -123,7 +119,7 @@ function fromItem(item: Item, id: number): Card {
     if (!allDay) timeStart = item.start.slice(0, 16);
   }
   if (dateless) {
-    allDay = true; // dateless → suggest an all-day event on the reminder date
+    allDay = true;
     dateStart = (item.reminder?.date || localNowIso()).slice(0, 10);
   }
 
@@ -169,25 +165,35 @@ function toCalItem(c: Card): CalItem {
   };
 }
 
-// ── styles ───────────────────────────────────────────────────────────────────
+// ── date formatting (read mode) ──────────────────────────────────────────────
 
-const input: React.CSSProperties = {
-  width: "100%",
-  padding: "0.55rem 0.65rem",
-  border: "1px solid #ccc",
-  borderRadius: 8,
-  fontSize: 16, // 16px avoids iOS Safari zoom-on-focus
-  boxSizing: "border-box",
-  background: "#fff",
-};
-const label: React.CSSProperties = {
-  fontSize: "0.72rem",
-  color: "#888",
-  textTransform: "uppercase",
-  letterSpacing: "0.03em",
-  marginBottom: 3,
-  display: "block",
-};
+function fmtDay(d: string): string {
+  if (!d) return "";
+  const [y, m, day] = d.split("-").map(Number);
+  return new Date(y, m - 1, day).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+}
+function fmtTime(local: string): string {
+  if (!local) return "";
+  return new Date(local).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+function dateLine(c: Card): string {
+  if (c.allDay) {
+    if (c.isDateRange && c.dateEnd) return `${fmtDay(c.dateStart)} – ${fmtDay(c.dateEnd)}`;
+    return `${fmtDay(c.dateStart)} · all day`;
+  }
+  const te = c.timeEnd ? `–${fmtTime(c.timeEnd)}` : "";
+  return `${fmtDay(c.dateStart)} · ${fmtTime(c.timeStart)}${te}`;
+}
+function short(u: string): string {
+  return u.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "");
+}
 
 // ── page ─────────────────────────────────────────────────────────────────────
 
@@ -200,8 +206,6 @@ export default function Home() {
   const [cards, setCards] = useState<Card[]>([]);
   const [processing, setProcessing] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  // The resolved post, shown as a preview the moment /api/resolve returns —
-  // before extraction finishes — so the user sees "it caught my post" fast.
   const [preview, setPreview] = useState<{
     thumbnail?: string;
     author_handle?: string;
@@ -213,7 +217,7 @@ export default function Home() {
     setSummary(r.post_summary);
     setConfidence(r.confidence);
     setCards(r.items.map((it, i) => fromItem(it, i)));
-    setPreview(null); // real cards replace the preview + skeletons
+    setPreview(null);
     setStage("results");
   }, []);
 
@@ -225,11 +229,7 @@ export default function Home() {
         const res = await fetch("/api/extract", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ...payload,
-            now: localNowIso(),
-            timezone: timezone(),
-          }),
+          body: JSON.stringify({ ...payload, now: localNowIso(), timezone: timezone() }),
         });
         if (!res.ok) {
           const b = await res.json().catch(() => ({}));
@@ -262,17 +262,14 @@ export default function Home() {
           body: JSON.stringify({ url: target }),
         });
         if (!res.ok) {
-          setError("Couldn’t read that link. Paste a screenshot instead.");
+          setError("Couldn’t read that link. Try a screenshot instead.");
           setStage("error");
           return;
         }
         const resolved = (await res.json()) as ResolveResult;
-        // Render the resolved post immediately — extraction continues below.
         const thumb = resolved.images?.[0];
         setPreview({
-          thumbnail: thumb
-            ? `data:${thumb.media_type};base64,${thumb.data}`
-            : undefined,
+          thumbnail: thumb ? `data:${thumb.media_type};base64,${thumb.data}` : undefined,
           author_handle: resolved.author_handle,
           caption: resolved.caption,
         });
@@ -284,7 +281,7 @@ export default function Home() {
           posted_at: resolved.posted_at ?? undefined,
         });
       } catch {
-        setError("Couldn’t reach that link. Paste a screenshot instead.");
+        setError("Couldn’t reach that link. Try a screenshot instead.");
         setStage("error");
       }
     },
@@ -311,7 +308,7 @@ export default function Home() {
     }
   }, [submitUrl]);
 
-  // Paste a screenshot from the clipboard, at any time.
+  // Paste a screenshot from the clipboard, any time.
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const item = Array.from(e.clipboardData?.items || []).find((i) =>
@@ -328,93 +325,140 @@ export default function Home() {
   const updateCard = (id: number, patch: Partial<Card>) =>
     setCards((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
 
-  return (
-    <main style={{ maxWidth: 560, margin: "0 auto", padding: "1.75rem 1rem 4rem" }}>
-      <style>{`
-        .sk{background:#ececec;border-radius:6px;animation:r2rpulse 1.2s ease-in-out infinite}
-        @keyframes r2rpulse{0%,100%{opacity:1}50%{opacity:.45}}
-      `}</style>
-      <h1 style={{ margin: "0 0 0.15rem", fontSize: "1.4rem" }}>Send to Agent</h1>
-      <p style={{ color: "#666", marginTop: 0, fontSize: "0.9rem" }}>
-        Paste an Instagram/TikTok link — get a calendar event, no typing.
-      </p>
-
-      {/* URL field */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void submitUrl(url);
-        }}
-        style={{ display: "flex", gap: 8, marginTop: "1rem" }}
+  const urlForm = (
+    <form
+      className="url-row"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submitUrl(url);
+      }}
+    >
+      <input
+        className="url-input"
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        placeholder="instagram.com/p/…"
+        disabled={busy}
+        inputMode="url"
+        autoCapitalize="off"
+        autoCorrect="off"
+      />
+      <button
+        type="submit"
+        className="btn btn-primary"
+        disabled={busy || !url.trim()}
+        style={{ flex: "0 0 auto", padding: "0 18px" }}
       >
-        <input
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://www.instagram.com/p/…"
-          disabled={busy}
-          inputMode="url"
-          autoCapitalize="off"
-          autoCorrect="off"
-          style={{ ...input, flex: 1 }}
-        />
-        <button
-          type="submit"
-          disabled={busy || !url.trim()}
-          style={{
-            padding: "0 1.1rem",
-            borderRadius: 8,
-            border: "none",
-            background: busy || !url.trim() ? "#bbb" : "#111",
-            color: "#fff",
-            fontWeight: 600,
-            fontSize: 16,
-          }}
-        >
-          Go
-        </button>
-      </form>
+        Go
+      </button>
+    </form>
+  );
 
-      {/* Stage 1: resolving the link (no preview yet). */}
-      {stage === "resolving" && (
-        <Progress
-          title="Resolving link…"
-          detail={`Fetching the post${processing ? ` — ${short(processing)}` : ""}. This can take a moment.`}
-        />
+  const pasteZone = (
+    <button className="paste" onClick={() => fileRef.current?.click()}>
+      Drop a screenshot, or tap to upload
+      <div className="paste-sub">paste with ⌘/Ctrl+V, or drag it here</div>
+    </button>
+  );
+
+  return (
+    <main className="app">
+      <header className="header">
+        <h1 className="display">Reel2Real</h1>
+        <p className="tagline">From your feed to your calendar.</p>
+      </header>
+
+      {/* Empty state — one unified action area */}
+      {stage === "idle" && (
+        <>
+          <div
+            className={`action${dragging ? " dragging" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragging(false);
+              const f = e.dataTransfer.files?.[0];
+              if (f && f.type.startsWith("image/")) void onScreenshot(f);
+            }}
+          >
+            <p className="action-copy">
+              Paste an Instagram or TikTok link — or drop a screenshot
+            </p>
+            {urlForm}
+            <div className="divider">or</div>
+            {pasteZone}
+          </div>
+          <p className="tip">
+            Tip: share straight from Instagram via the Reel2Real shortcut
+          </p>
+        </>
       )}
 
-      {/* Stage 2: post caught → show the resolved preview + skeleton cards while
-          /api/extract runs. The user sees "it caught my post" within ~3s. */}
+      {/* Persistent URL field for a new post in every other state */}
+      {stage !== "idle" && urlForm}
+
+      {/* Resolving — the link as a breathing chip */}
+      {stage === "resolving" && (
+        <>
+          <div className="chip">
+            <span className="chip-dot" />
+            <span className="chip-url">{short(processing || "")}</span>
+          </div>
+          <div className="alt">
+            <div className="alt-label">Taking a moment? Paste a screenshot instead</div>
+            {pasteZone}
+          </div>
+        </>
+      )}
+
+      {/* Preview + skeletons — the "caught it" moment */}
       {stage === "extracting" && (
-        <section style={{ marginTop: "1rem" }}>
-          {preview && <ResolvedPreview {...preview} />}
-          <SkeletonCards count={2} />
+        <section>
+          {preview && (
+            <div className="card preview rise">
+              {preview.thumbnail ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img className="preview-thumb" src={preview.thumbnail} alt="" />
+              ) : (
+                <div className="preview-thumb sk" />
+              )}
+              <div className="preview-body">
+                <div className="preview-handle">
+                  {preview.author_handle || "Your post"}
+                </div>
+                <div className="preview-status">Got it — reading the post…</div>
+                {preview.caption && (
+                  <div className="preview-caption">{preview.caption}</div>
+                )}
+              </div>
+            </div>
+          )}
+          <SkeletonCard />
+          <SkeletonCard />
         </section>
       )}
 
-      {/* Error with fallback emphasis */}
+      {/* Error — calm, with a screenshot path */}
       {stage === "error" && error && (
-        <div
-          style={{
-            marginTop: "1rem",
-            padding: "0.9rem 1rem",
-            background: "#fdecea",
-            border: "1px solid #f5c6cb",
-            borderRadius: 10,
-            color: "#8a1c1c",
-            fontSize: "0.9rem",
-          }}
-        >
-          {error}
-        </div>
+        <>
+          <div className="notice">{error}</div>
+          <div className="alt">
+            <div className="alt-label">Try a screenshot instead</div>
+            {pasteZone}
+          </div>
+        </>
       )}
 
       {/* Results */}
       {stage === "results" && (
-        <section style={{ marginTop: "1.25rem" }}>
+        <section>
           {summary && (
-            <p style={{ color: "#444", fontSize: "0.88rem" }}>
-              {summary}{" "}
-              <span style={{ color: "#aaa" }}>· confidence {confidence}</span>
+            <p className="summary">
+              {summary} <span className="conf">· {confidence} confidence</span>
             </p>
           )}
           {cards.map((c) => (
@@ -428,173 +472,83 @@ export default function Home() {
         </section>
       )}
 
-      {/* Always-visible screenshot fallback: paste / upload / drag-drop */}
-      <section
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragging(true);
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void onScreenshot(f);
         }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragging(false);
-          const f = e.dataTransfer.files?.[0];
-          if (f && f.type.startsWith("image/")) void onScreenshot(f);
-        }}
-        style={{
-          marginTop: "1.75rem",
-          padding: "1rem",
-          borderTop: "1px solid #eee",
-          borderRadius: 10,
-          background: dragging ? "#eef4ff" : "transparent",
-          outline: dragging ? "2px dashed #6a9bff" : "none",
-        }}
-      >
-        <div style={{ fontSize: "0.82rem", color: "#666", marginBottom: 8 }}>
-          {stage === "resolving"
-            ? "Taking a while? Paste a screenshot instead —"
-            : "Or paste / upload / drag a screenshot"}
-        </div>
-        <button
-          onClick={() => fileRef.current?.click()}
-          disabled={stage === "extracting"}
-          style={{
-            padding: "0.6rem 1rem",
-            borderRadius: 8,
-            border: "1px dashed #aaa",
-            background: "#fafafa",
-            fontSize: 15,
-            width: "100%",
-          }}
-        >
-          Choose screenshot… (or ⌘/Ctrl+V to paste)
-        </button>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/png,image/jpeg"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) void onScreenshot(f);
-          }}
-        />
-      </section>
+      />
     </main>
   );
 }
 
-function short(u: string): string {
-  return u.length > 44 ? u.slice(0, 41) + "…" : u;
-}
+// ── skeleton (mirrors the result card layout exactly) ────────────────────────
 
-function Progress({ title, detail }: { title: string; detail: string }) {
+function SkeletonCard() {
   return (
-    <div
-      style={{
-        marginTop: "1rem",
-        padding: "0.9rem 1rem",
-        background: "#f4f7ff",
-        border: "1px solid #d6e0ff",
-        borderRadius: 10,
-      }}
-    >
-      <div style={{ fontWeight: 600 }}>{title}</div>
-      <div style={{ color: "#555", fontSize: "0.88rem", marginTop: 2 }}>{detail}</div>
-    </div>
-  );
-}
-
-// The resolved post, shown the instant /api/resolve returns — "it caught my post".
-function ResolvedPreview({
-  thumbnail,
-  author_handle,
-  caption,
-}: {
-  thumbnail?: string;
-  author_handle?: string;
-  caption?: string;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        gap: 12,
-        padding: "0.85rem",
-        border: "1px solid #d8ecdc",
-        background: "#f3fbf5",
-        borderRadius: 12,
-      }}
-    >
-      {thumbnail ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src={thumbnail}
-          alt=""
-          style={{
-            width: 60,
-            height: 60,
-            objectFit: "cover",
-            borderRadius: 8,
-            flexShrink: 0,
-          }}
-        />
-      ) : (
-        <div className="sk" style={{ width: 60, height: 60, flexShrink: 0 }} />
-      )}
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
-          ✓ Got it{author_handle ? ` — ${author_handle}` : ""}
-          <span style={{ color: "#3a8", fontWeight: 500 }}> · reading the post…</span>
-        </div>
-        {caption && (
-          <div
-            style={{
-              fontSize: "0.8rem",
-              color: "#556",
-              marginTop: 4,
-              display: "-webkit-box",
-              WebkitLineClamp: 2,
-              WebkitBoxOrient: "vertical",
-              overflow: "hidden",
-            }}
-          >
-            {caption}
-          </div>
-        )}
+    <div className="card">
+      <div className="sk" style={{ height: 11, width: "22%" }} />
+      <div className="sk" style={{ height: 18, width: "72%", marginTop: 8 }} />
+      <div className="sk" style={{ height: 15, width: "42%", marginTop: 8 }} />
+      <div className="sk" style={{ height: 14, width: "56%", marginTop: 12 }} />
+      <div className="sk" style={{ height: 12, width: "90%", marginTop: 12 }} />
+      <div className="sk" style={{ height: 12, width: "78%", marginTop: 6 }} />
+      <div className="btn-row">
+        <div className="sk" style={{ height: 44, flex: 1 }} />
+        <div className="sk" style={{ height: 44, flex: 1 }} />
       </div>
     </div>
   );
 }
 
-// Placeholder cards shown while extraction runs.
-function SkeletonCards({ count }: { count: number }) {
+// ── tap-to-edit text field ───────────────────────────────────────────────────
+
+function InlineText({
+  value,
+  onChange,
+  placeholder,
+  className,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  if (editing) {
+    return (
+      <input
+        className="field-input"
+        autoFocus
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={() => setEditing(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            setEditing(false);
+          }
+        }}
+      />
+    );
+  }
   return (
-    <>
-      {Array.from({ length: count }).map((_, i) => (
-        <div key={i} style={{ ...card, marginTop: "0.85rem" }}>
-          <div className="sk" style={{ height: 12, width: "22%" }} />
-          <div className="sk" style={{ height: 16, width: "70%", marginTop: 10 }} />
-          <div className="sk" style={{ height: 12, width: "45%", marginTop: 10 }} />
-          <div className="sk" style={{ height: 12, width: "85%", marginTop: 10 }} />
-          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-            <div className="sk" style={{ height: 38, flex: 1 }} />
-            <div className="sk" style={{ height: 38, flex: 1 }} />
-          </div>
-        </div>
-      ))}
-    </>
+    <button
+      type="button"
+      className={`field${className ? " " + className : ""}`}
+      onClick={() => setEditing(true)}
+    >
+      {value || <span style={{ color: "var(--text-3)" }}>{placeholder}</span>}
+    </button>
   );
 }
 
-// ── card ─────────────────────────────────────────────────────────────────────
-
-const card: React.CSSProperties = {
-  border: "1px solid #e3e3e3",
-  borderRadius: 12,
-  padding: "1rem",
-  marginTop: "0.85rem",
-};
+// ── result card ──────────────────────────────────────────────────────────────
 
 function CardView({
   card: c,
@@ -605,277 +559,270 @@ function CardView({
   onChange: (patch: Partial<Card>) => void;
   onRetryScreenshot: () => void;
 }) {
-  // Unreadable → recovery affordance, primary action is the paste fallback.
+  const [dateOpen, setDateOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [added, setAdded] = useState(false);
+
+  // unreadable → warm recovery card, screenshot as the primary action
   if (c.unreadable) {
     return (
-      <div style={{ ...card, background: "#fff9ec", border: "1px solid #f0d8a8" }}>
-        <strong>Couldn’t read this post</strong>
-        <div style={{ fontSize: "0.85rem", color: "#6b5a30", marginTop: 4 }}>
-          A screenshot of the post usually works better.
-        </div>
+      <div className="card card--recover rise">
+        <div className="recover-title">Couldn’t read this one</div>
+        <div className="recover-copy">A screenshot of the post usually works better.</div>
         <button
+          className="btn btn-primary"
+          style={{ marginTop: 12 }}
           onClick={onRetryScreenshot}
-          style={{
-            marginTop: "0.7rem",
-            padding: "0.55rem 1rem",
-            borderRadius: 8,
-            border: "none",
-            background: "#111",
-            color: "#fff",
-            fontWeight: 600,
-            fontSize: 15,
-          }}
         >
-          Paste or upload a screenshot
+          Try a screenshot
         </button>
       </div>
     );
   }
 
-  // Past event → greyed out, no actions.
+  // past → greyed, compressed, no actions
   if (c.past) {
     return (
-      <div style={{ ...card, opacity: 0.5 }}>
+      <div className="card card--past rise">
         <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-          <strong>{c.title}</strong>
-          <span style={{ fontSize: "0.68rem", color: "#a00" }}>PAST EVENT</span>
+          <div className="card-title">{c.title}</div>
+          <span className="past-label">already happened</span>
         </div>
-        {c.dateStart && (
-          <div style={{ fontSize: "0.82rem", color: "#666", marginTop: 4 }}>
-            🗓 {c.timeStart || c.dateStart}
-          </div>
-        )}
-        {c.location && (
-          <div style={{ fontSize: "0.82rem", color: "#666", marginTop: 2 }}>
-            📍 {c.location}
+        {(c.timeStart || c.dateStart) && (
+          <div className="card-date" style={{ color: "var(--text-3)" }}>
+            {dateLine(c)}
           </div>
         )}
       </div>
     );
   }
 
-  // "other" with no venue/date → summary only, no calendar affordance.
-  const nothingActionable =
-    c.type === "other" && !c.location && !c.dateStart && !c.timeStart;
-  if (nothingActionable) {
+  // "other" with nothing actionable → summary only
+  if (c.type === "other" && !c.location && !c.dateStart && !c.timeStart) {
     return (
-      <div style={{ ...card }}>
-        <strong>{c.title}</strong>
-        {c.notes && (
-          <div style={{ fontSize: "0.82rem", color: "#666", marginTop: 6 }}>
-            {c.notes}
-          </div>
-        )}
+      <div className="card rise">
+        <div className="card-title">{c.title}</div>
+        {c.notes && <div className="card-notes">{c.notes}</div>}
       </div>
     );
   }
 
   const cal = toCalItem(c);
-  const showCalendar = !(c.dateless && c.skip);
+  const showCal = !(c.dateless && c.skip);
 
   return (
-    <div style={card}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-        <span style={{ fontSize: "0.68rem", color: "#999", textTransform: "uppercase" }}>
-          {c.type}
-        </span>
-      </div>
+    <div className="card rise">
+      <div className="card-kicker">{c.type}</div>
 
-      {/* Title */}
-      <div style={{ marginTop: 4 }}>
-        <label style={label}>Title</label>
-        <input
+      {/* Title — the decision */}
+      <div>
+        <InlineText
+          className="card-title"
           value={c.title}
-          onChange={(e) => onChange({ title: e.target.value })}
-          style={input}
+          onChange={(t) => onChange({ title: t })}
+          placeholder="Untitled"
         />
       </div>
 
-      {/* Dateless prompt (place / recipe / product) */}
-      {c.dateless && (
-        <div
-          style={{
-            marginTop: 10,
-            fontSize: "0.8rem",
-            color: "#555",
-            background: "#f7f7f7",
-            padding: "0.5rem 0.6rem",
-            borderRadius: 8,
-          }}
-        >
-          No date in this post — pick one to add an all-day reminder, or skip.
-          <label style={{ marginLeft: 8 }}>
-            <input
-              type="checkbox"
-              checked={c.skip}
-              onChange={(e) => onChange({ skip: e.target.checked })}
-            />{" "}
-            skip (reminder only)
-          </label>
+      {/* Date/time — beneath the title, in accent */}
+      {!c.dateless ? (
+        <>
+          <button
+            type="button"
+            className="card-date"
+            onClick={() => setDateOpen((o) => !o)}
+          >
+            {dateLine(c)}{" "}
+            <span style={{ opacity: 0.5, fontWeight: 400 }}>
+              {dateOpen ? "▲" : "✎"}
+            </span>
+          </button>
+          {dateOpen && <DateEdit c={c} onChange={onChange} />}
+        </>
+      ) : (
+        <DatelessSuggest c={c} onChange={onChange} />
+      )}
+
+      {/* Location — third, with subtle via-Maps affordance */}
+      {c.location && (
+        <div className="card-loc">
+          <span>📍</span>
+          <InlineText
+            value={c.location}
+            onChange={(v) => onChange({ location: v })}
+            placeholder="Add location"
+          />
+          {c.address_source === "resolved" && c.maps_url && (
+            <a className="via-maps" href={c.maps_url} target="_blank" rel="noreferrer">
+              via Maps
+            </a>
+          )}
         </div>
       )}
 
-      {/* Date/time — all-day vs timed */}
-      {!c.dateless && (
-        <label style={{ display: "block", marginTop: 10, fontSize: "0.8rem", color: "#555" }}>
-          <input
-            type="checkbox"
-            checked={c.allDay}
-            onChange={(e) => onChange({ allDay: e.target.checked })}
-          />{" "}
-          all-day
-        </label>
+      {/* Notes — confirmation, collapsed to 2 lines */}
+      {editingNotes ? (
+        <textarea
+          className="field-area"
+          style={{ marginTop: 10 }}
+          autoFocus
+          value={c.notes}
+          onChange={(e) => onChange({ notes: e.target.value })}
+          onBlur={() => setEditingNotes(false)}
+        />
+      ) : (
+        c.notes && (
+          <div>
+            <div
+              className={`card-notes${notesOpen ? "" : " clamp"}`}
+              onClick={() => setEditingNotes(true)}
+            >
+              {c.notes}
+            </div>
+            {c.notes.length > 90 && (
+              <button className="more" onClick={() => setNotesOpen((o) => !o)}>
+                {notesOpen ? "less" : "more"}
+              </button>
+            )}
+          </div>
+        )
       )}
 
+      {/* Actions */}
+      {showCal ? (
+        <>
+          <div className="btn-row">
+            <a
+              className="btn btn-primary"
+              href={icsHref(cal)}
+              onClick={() => setAdded(true)}
+            >
+              Apple Calendar
+            </a>
+            <a
+              className="btn btn-secondary"
+              href={googleCalUrl(cal)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Google
+            </a>
+          </div>
+          {added && <div className="added">✓ Added</div>}
+        </>
+      ) : (
+        <div className="added" style={{ color: "var(--text-2)" }}>
+          🔔 Reminder only — {c.reminderLabel}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Expandable date editor (revealed on tap — inputs are never always-visible).
+function DateEdit({ c, onChange }: { c: Card; onChange: (p: Partial<Card>) => void }) {
+  return (
+    <div className="date-edit">
+      <label className="allday-row">
+        <input
+          type="checkbox"
+          checked={c.allDay}
+          onChange={(e) => onChange({ allDay: e.target.checked })}
+        />
+        all-day
+      </label>
       {c.allDay ? (
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>{c.isDateRange ? "Start day" : "Day"}</label>
+        <>
+          <div className="col">
+            <label>{c.isDateRange ? "Start day" : "Day"}</label>
             <input
               type="date"
               value={c.dateStart}
               onChange={(e) => onChange({ dateStart: e.target.value })}
-              style={input}
             />
           </div>
           {c.isDateRange && (
-            <div style={{ flex: 1 }}>
-              <label style={label}>End day (incl.)</label>
+            <div className="col">
+              <label>End day</label>
               <input
                 type="date"
                 value={c.dateEnd}
                 onChange={(e) => onChange({ dateEnd: e.target.value })}
-                style={input}
               />
             </div>
           )}
-        </div>
+        </>
       ) : (
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-          <div style={{ flex: 1 }}>
-            <label style={label}>Start</label>
+        <>
+          <div className="col">
+            <label>Start</label>
             <input
               type="datetime-local"
               value={c.timeStart}
               onChange={(e) => onChange({ timeStart: e.target.value })}
-              style={input}
             />
           </div>
-          <div style={{ flex: 1 }}>
-            <label style={label}>End (optional)</label>
+          <div className="col">
+            <label>End</label>
             <input
               type="datetime-local"
               value={c.timeEnd}
               onChange={(e) => onChange({ timeEnd: e.target.value })}
-              style={input}
             />
           </div>
-        </div>
+        </>
       )}
-
-      {/* Location */}
-      <div style={{ marginTop: 10 }}>
-        <label style={label}>Location</label>
-        <input
-          value={c.location}
-          onChange={(e) => onChange({ location: e.target.value })}
-          style={input}
-        />
-        {c.address_source === "resolved" && c.resolved_address && (
-          <div style={{ fontSize: "0.76rem", color: "#777", marginTop: 4 }}>
-            ✅ {c.resolved_address}
-            {c.resolved_address !== c.location && (
-              <button
-                onClick={() => onChange({ location: c.resolved_address! })}
-                style={{
-                  marginLeft: 8,
-                  fontSize: "0.74rem",
-                  border: "1px solid #ccc",
-                  borderRadius: 6,
-                  background: "#fff",
-                  padding: "1px 6px",
-                }}
-              >
-                use
-              </button>
-            )}
-            {c.maps_url && (
-              <>
-                {" · "}
-                <a href={c.maps_url} target="_blank" rel="noreferrer">
-                  Maps
-                </a>
-              </>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Notes */}
-      <div style={{ marginTop: 10 }}>
-        <label style={label}>Notes</label>
-        <textarea
-          value={c.notes}
-          onChange={(e) => onChange({ notes: e.target.value })}
-          rows={3}
-          style={{ ...input, resize: "vertical", fontFamily: "inherit" }}
-        />
-      </div>
-
-      {/* Reminder */}
-      <div style={{ marginTop: 10 }}>
-        <label style={label}>Reminder</label>
+      <div className="col" style={{ flexBasis: "100%" }}>
+        <label>Reminder</label>
         <input
           type="datetime-local"
           value={c.reminderLocal}
           onChange={(e) => onChange({ reminderLocal: e.target.value })}
-          style={input}
         />
       </div>
+    </div>
+  );
+}
 
-      {/* Actions */}
-      {showCalendar ? (
-        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-          <a
-            href={icsHref(cal)}
-            style={{
-              flex: 1,
-              textAlign: "center",
-              padding: "0.6rem",
-              borderRadius: 8,
-              background: "#111",
-              color: "#fff",
-              fontWeight: 600,
-              textDecoration: "none",
-              fontSize: 15,
-            }}
-          >
-            Apple Calendar
-          </a>
-          <a
-            href={googleCalUrl(cal)}
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              flex: 1,
-              textAlign: "center",
-              padding: "0.6rem",
-              borderRadius: 8,
-              border: "1px solid #111",
-              color: "#111",
-              fontWeight: 600,
-              textDecoration: "none",
-              fontSize: 15,
-            }}
-          >
-            Google Calendar
-          </a>
-        </div>
-      ) : (
-        <div style={{ marginTop: 14, fontSize: "0.82rem", color: "#3a6" }}>
-          🔔 Reminder only — {c.reminderLabel}
-        </div>
+// Dateless (place / recipe / product) — a suggestion, not a form.
+function DatelessSuggest({
+  c,
+  onChange,
+}: {
+  c: Card;
+  onChange: (p: Partial<Card>) => void;
+}) {
+  return (
+    <div className="suggest">
+      <div style={{ marginBottom: 6 }}>
+        No date on this — {c.skip ? "just a reminder." : `try ${fmtDay(c.dateStart)}?`}
+      </div>
+      {!c.skip && (
+        <input
+          type="date"
+          value={c.dateStart}
+          onChange={(e) => onChange({ dateStart: e.target.value })}
+          style={{
+            height: 44,
+            width: "100%",
+            background: "var(--surface)",
+            border: "1px solid var(--line)",
+            borderRadius: 8,
+            padding: "0 10px",
+            fontSize: 16,
+            color: "var(--text)",
+          }}
+        />
       )}
+      <label className="allday-row" style={{ marginTop: 8 }}>
+        <input
+          type="checkbox"
+          checked={c.skip}
+          onChange={(e) => onChange({ skip: e.target.checked })}
+        />
+        just remind me, don’t add to calendar
+      </label>
     </div>
   );
 }

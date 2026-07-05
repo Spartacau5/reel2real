@@ -1,9 +1,10 @@
+import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 
 export const metadata: Metadata = {
-  title: "Send to Agent",
-  description: "Instagram/TikTok post → calendar action, zero typing.",
+  title: "Reel2Real",
+  description: "From your feed to your calendar.",
 };
 
 export const viewport: Viewport = {
@@ -14,15 +15,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
-      <body
-        style={{
-          margin: 0,
-          fontFamily:
-            "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-        }}
-      >
-        {children}
-      </body>
+      <body>{children}</body>
     </html>
   );
 }
