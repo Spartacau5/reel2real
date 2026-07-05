@@ -99,6 +99,7 @@ export interface ExtractRequest {
   // Pre-resolved path (from /api/resolve)
   caption?: string;
   images?: EncodedImageInput[];
+  is_carousel?: boolean;
   author_handle?: string;
   posted_at?: string;
 
@@ -112,6 +113,8 @@ export interface ExtractionInput {
   caption?: string;
   /** base64 images (screenshot from client, or resolved post images). */
   images: Array<{ data: string; media_type: string }>;
+  /** true only for multi-image carousels; otherwise only the first image is sent. */
+  is_carousel?: boolean;
   author_handle?: string;
   posted_at?: string;
   now: string;

@@ -37,19 +37,30 @@ export async function POST(req: Request) {
   if (!validated.ok) {
     return err("invalid_request", 400, validated.error);
   }
-  const { image, media_type, caption, images, author_handle, posted_at, now, timezone } =
-    validated.data;
+  const {
+    image,
+    media_type,
+    caption,
+    images,
+    is_carousel,
+    author_handle,
+    posted_at,
+    now,
+    timezone,
+  } = validated.data;
 
   // 3. Build the extraction input from either the screenshot or the resolved bundle.
   const input: ExtractionInput = image
     ? {
         images: [{ data: image, media_type: media_type as string }],
+        is_carousel: false, // a single pasted screenshot is never a carousel
         now,
         timezone,
       }
     : {
         caption,
         images: images ?? [],
+        is_carousel: is_carousel ?? false,
         author_handle,
         posted_at,
         now,
@@ -58,8 +69,21 @@ export async function POST(req: Request) {
 
   // 4. Run the extraction.
   try {
-    const result: ExtractResponse = await extract(input);
-    return NextResponse.json(result, { status: 200 });
+    const { data, timings } = await extract(input);
+    const serverTiming = [
+      `downscale;dur=${timings.downscale_ms}`,
+      `anthropic;dur=${timings.anthropic_ms}`,
+      `geocode;dur=${timings.geocode_ms}`,
+      `other;dur=${timings.other_ms}`,
+      `total;dur=${timings.total_ms}`,
+    ].join(", ");
+    return NextResponse.json(data as ExtractResponse, {
+      status: 200,
+      headers: {
+        "Server-Timing": serverTiming,
+        "X-Extract-Timings": JSON.stringify(timings),
+      },
+    });
   } catch (e) {
     if (e instanceof ClaudeParseError) {
       return err("extraction_failed", 502, "Model returned unparseable output.");

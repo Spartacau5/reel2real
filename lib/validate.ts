@@ -45,6 +45,7 @@ const extractSchema = z
     media_type: z.enum(ALLOWED_MEDIA_TYPES).optional(),
     caption: z.string().optional(),
     images: z.array(encodedImage).optional(),
+    is_carousel: z.boolean().optional(),
     author_handle: z.string().optional(),
     posted_at: z.string().optional(),
     now: z.string({ required_error: "now is required" }).min(1, "now is required"),

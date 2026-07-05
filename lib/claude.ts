@@ -12,12 +12,33 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { ExtractionInput, ExtractResponse } from "./types";
 import { extractResponseSchema } from "./schema";
-import { downscaleImages } from "./image";
+import { downscaleImage } from "./image";
 import { markPastEvents } from "./postprocess";
 import { enrichLocations } from "./geocode";
 
-/** Model id per SPEC.md → Architecture. */
-export const MODEL = "claude-sonnet-4-6";
+/** Per-stage timings for one /api/extract call (all ms). */
+export interface ExtractTimings {
+  downscale_ms: number; // wall-clock for the (parallel) image downscale
+  per_image_ms: number[]; // each image's own downscale duration
+  images_sent: number;
+  anthropic_ms: number; // pure Anthropic Messages API call(s)
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  max_tokens: number;
+  geocode_ms: number; // Google Places enrichment
+  other_ms: number; // parse/validate/postprocess/json — the remainder
+  total_ms: number;
+}
+
+/** extract() returns the response plus per-stage timings for observability. */
+export interface ExtractResult {
+  data: ExtractResponse;
+  timings: ExtractTimings;
+}
+
+/** Model id per SPEC.md → Architecture. Override with EXTRACT_MODEL. */
+export const MODEL = process.env.EXTRACT_MODEL || "claude-sonnet-4-6";
 
 const MAX_TOKENS = 4096;
 
@@ -78,15 +99,14 @@ function getClient(): Anthropic {
 }
 
 /**
- * Full system prompt: schema + every extraction rule from SPEC.md. `now` and
- * `timezone` are injected so all relative-date resolution is deterministic.
+ * Full system prompt: schema + every extraction rule from SPEC.md. STATIC (no
+ * per-request data) so it can be prompt-cached — `now`/`timezone` are sent in
+ * the user turn instead (see buildUserContent), keeping the cached prefix stable.
  */
-export function buildSystemPrompt(now: string, timezone: string): string {
+export function buildSystemPrompt(): string {
   return `You extract actionable intent from social media posts (usually Instagram/TikTok) and return ONLY valid JSON. No prose, no markdown fences, no code blocks — the first character of your reply MUST be "{".
 
-CURRENT TIME (now): ${now}
-TIMEZONE: ${timezone}
-Resolve every relative date/time against now + timezone.
+Resolve every relative date/time against the CURRENT TIME (now) and TIMEZONE provided in the user message.
 
 Return an object of this exact shape:
 {
@@ -134,6 +154,7 @@ DATE & TIME:
 9. NEVER split same-event showtimes. Multiple showtimes of the same event/series on the same day = ONE item (start = first showtime, all times in notes). Two films at one movie night is ONE outing, not two items.
 10. NEVER use post metadata as an event time. The post's publish time (posted_at), a "posted 1w ago" label, or a status-bar clock is NOT an event time. Only times stated in the caption/flyer count. No stated time → all_day true; do not borrow a time from metadata.
 11. Emit one item per distinct dated sub-event, even when a caption frames them inside one opening/pop-up window — a series listing June 27, July 2, July 4, July 9 is FOUR items, not one. Do NOT decide which are past; that is handled automatically after extraction.
+12. Multiple dates like "X & Y" that appear together WITH range language ("through the Nth", "until the Nth", "open X–Y", "available X through Y") → ONE date-range item ending on the Nth: all_day true, is_date_range true, range_end_date = the Nth, start = the first date; put the featured dates in notes. WITHOUT explicit range language, distinct dates stay distinct items (rule 11). Example: "collab July 4 & 11, available through the 11th" → one all-day range July 4→11.
 
 REMINDER TIMING:
 - Ticketed/RSVP events → reminder 3 days before start; label includes the action.
@@ -163,18 +184,44 @@ type ImageBlock = {
   source: { type: "base64"; media_type: "image/png" | "image/jpeg"; data: string };
 };
 
-async function buildUserContent(input: ExtractionInput) {
+async function buildUserContent(input: ExtractionInput): Promise<{
+  content: Array<ImageBlock | { type: "text"; text: string }>;
+  downscaleMs: number;
+  perImageMs: number[];
+}> {
   const content: Array<ImageBlock | { type: "text"; text: string }> = [];
 
-  // Downscale every image to <=1568px long edge before sending to Claude
-  // (SPEC.md → Image Handling / Error Handling), regardless of source.
-  const downscaled = await downscaleImages(input.images);
+  // Send all images only for carousels; otherwise just the first (a single post
+  // / reel / screenshot needs one image). Saves vision tokens.
+  const selected = input.is_carousel ? input.images : input.images.slice(0, 1);
+
+  // Downscale to <=1568px before sending to Claude (SPEC.md → Image Handling).
+  // Images run in PARALLEL (Promise.all); per-image timing proves it (wall ≈ max).
+  const perImageMs: number[] = [];
+  const dt0 = Date.now();
+  const downscaled = await Promise.all(
+    selected.map(async (img) => {
+      const t = Date.now();
+      const r = await downscaleImage(img.data, img.media_type);
+      perImageMs.push(Date.now() - t);
+      return r;
+    }),
+  );
+  const downscaleMs = Date.now() - dt0;
+
   for (const img of downscaled) {
     content.push({
       type: "image",
       source: { type: "base64", media_type: img.media_type, data: img.data },
     });
   }
+
+  // Per-request now/timezone go in the USER turn (not the cached system prompt)
+  // so the system prefix stays byte-stable and cacheable.
+  content.push({
+    type: "text",
+    text: `CURRENT TIME (now): ${input.now}\nTIMEZONE: ${input.timezone}`,
+  });
 
   // Caption (from URL resolution) is clean and untruncated — prefer it over OCR.
   if (input.caption) {
@@ -195,7 +242,7 @@ async function buildUserContent(input: ExtractionInput) {
     text: "Extract all actionable items from this post as JSON per the schema. Output JSON only.",
   });
 
-  return content;
+  return { content, downscaleMs, perImageMs };
 }
 
 function parseJson(text: string): unknown {
@@ -221,16 +268,56 @@ function textFromResponse(msg: Anthropic.Message): string {
  * appended. If it still doesn't parse, synthesize a type:"other" item at low
  * confidence rather than erroring (SPEC.md → Error Handling: never error).
  */
-export async function extract(input: ExtractionInput): Promise<ExtractResponse> {
+export async function extract(input: ExtractionInput): Promise<ExtractResult> {
   const anthropic = getClient();
-  const system = buildSystemPrompt(input.now, input.timezone);
-  const userContent = await buildUserContent(input);
+  const t0 = Date.now();
+
+  const { content: userContent, downscaleMs, perImageMs } = await buildUserContent(input);
+
+  // System prompt is static → cache it (prompt caching). now/timezone live in
+  // the user turn so this prefix never changes across requests.
+  const system: Anthropic.TextBlockParam[] = [
+    {
+      type: "text",
+      text: buildSystemPrompt(),
+      cache_control: { type: "ephemeral" },
+    },
+  ];
 
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: userContent },
   ];
 
+  let anthropicMs = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheRead = 0;
+
+  const finish = (
+    data: ExtractResponse,
+    geocodeMs: number,
+  ): ExtractResult => {
+    const total = Date.now() - t0;
+    return {
+      data,
+      timings: {
+        downscale_ms: downscaleMs,
+        per_image_ms: perImageMs,
+        images_sent: perImageMs.length,
+        anthropic_ms: anthropicMs,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_tokens: cacheRead,
+        max_tokens: MAX_TOKENS,
+        geocode_ms: geocodeMs,
+        other_ms: Math.max(0, total - downscaleMs - anthropicMs - geocodeMs),
+        total_ms: total,
+      },
+    };
+  };
+
   for (let attempt = 0; attempt < 2; attempt++) {
+    const tA = Date.now();
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
@@ -238,6 +325,12 @@ export async function extract(input: ExtractionInput): Promise<ExtractResponse> 
       system,
       messages,
     });
+    anthropicMs += Date.now() - tA;
+
+    const u = response.usage;
+    inputTokens += u.input_tokens;
+    outputTokens += u.output_tokens;
+    cacheRead += u.cache_read_input_tokens ?? 0;
 
     const raw = textFromResponse(response);
     try {
@@ -245,8 +338,9 @@ export async function extract(input: ExtractionInput): Promise<ExtractResponse> 
       // Deterministic post-processing (SPEC.md → Post-Processing / Location
       // Enrichment): mark past events in code, then resolve missing addresses.
       parsed.items = markPastEvents(parsed.items, input.now);
+      const tG = Date.now();
       parsed.items = await enrichLocations(parsed.items);
-      return parsed;
+      return finish(parsed, Date.now() - tG);
     } catch {
       if (attempt === 0) {
         // One retry: feed back the bad output and demand valid JSON only.
@@ -260,10 +354,10 @@ export async function extract(input: ExtractionInput): Promise<ExtractResponse> 
       }
       // Retry exhausted — never error; return a synthesized "other" item.
       console.warn("[claude] extraction unparseable after retry; synthesizing 'other'");
-      return synthesizeOther();
+      return finish(synthesizeOther(), 0);
     }
   }
 
   // Unreachable, but keeps the type checker happy.
-  return synthesizeOther();
+  return finish(synthesizeOther(), 0);
 }

@@ -3,12 +3,17 @@
 //
 // Common interface:  resolve(url) → { caption, images[], author_handle, posted_at? }
 //
-//   - Instagram: Apify Instagram Scraper (SCRAPER_API_KEY = Apify token).
-//                Direct scraping from serverless IPs gets blocked — don't attempt.
-//   - TikTok:    open oEmbed first (https://www.tiktok.com/oembed?url=...),
-//                scraper API only if oEmbed is insufficient.
+//   - Instagram: driver chain, tried in order (env RESOLVE_DRIVER_ORDER):
+//       1. sociavault — SociaVault post-info API (SOCIAVAULT_API_KEY). PRIMARY.
+//                       8s timeout, no retry — failures fall through to apify.
+//       2. apify       — Apify Instagram Scraper (SCRAPER_API_KEY). FALLBACK.
+//                       25s per attempt + one retry on timeout.
+//     Direct scraping from serverless IPs gets blocked — don't attempt.
+//   - TikTok:    oEmbed (https://www.tiktok.com/oembed?url=...).
 //   - Download up to 3 post images (carousels). Video reels: thumbnail + caption only.
-//   - Timeout: 8s total. On failure/timeout throw ResolutionError → route returns 422.
+//   - On total failure throw ResolutionError → route returns 422.
+
+export type ResolveDriver = "sociavault" | "apify" | "tiktok-oembed";
 
 export interface ResolvedPost {
   /** Clean, untruncated caption text. Prefer over OCR'd caption when both exist. */
@@ -19,6 +24,10 @@ export interface ResolvedPost {
   author_handle: string;
   /** ISO 8601, if available */
   posted_at?: string;
+  /** true if the post is a multi-image carousel (send all images to Claude). */
+  is_carousel?: boolean;
+  /** which driver produced this result */
+  driver?: ResolveDriver;
 }
 
 /** Thrown when a URL cannot be resolved (block, timeout, unsupported host). */
@@ -45,6 +54,12 @@ const MAX_IMAGES = 3;
 
 /** Default Apify actor; override with APIFY_ACTOR_ID. */
 const APIFY_ACTOR_ID = process.env.APIFY_ACTOR_ID || "apify~instagram-scraper";
+
+/** SociaVault Instagram post-info endpoint + its (short, no-retry) timeout. */
+const SOCIAVAULT_ENDPOINT =
+  process.env.SOCIAVAULT_ENDPOINT ||
+  "https://api.sociavault.com/v1/scrape/instagram/post-info";
+const SOCIAVAULT_TIMEOUT_MS = 8_000;
 
 type Platform = "instagram" | "tiktok" | "unknown";
 
@@ -112,7 +127,7 @@ function collectInstagramImageUrls(item: Record<string, unknown>): string[] {
   return urls;
 }
 
-async function resolveInstagram(url: string, signal: AbortSignal): Promise<ResolvedPost> {
+async function apifyInstagram(url: string, signal: AbortSignal): Promise<ResolvedPost> {
   const token = process.env.SCRAPER_API_KEY;
   if (!token) throw new ResolutionError("scraper_key_missing");
 
@@ -154,12 +169,16 @@ async function resolveInstagram(url: string, signal: AbortSignal): Promise<Resol
   const posted_at =
     typeof item.timestamp === "string" ? item.timestamp : undefined;
 
+  const is_carousel =
+    item.type === "Sidecar" ||
+    (Array.isArray(item.childPosts) && item.childPosts.length > 0) ||
+    (Array.isArray(item.images) && item.images.length > 1);
   const images = await fetchImages(collectInstagramImageUrls(item), signal);
 
   // A post with neither caption nor images is not usable → fall back to paste.
   if (!caption && images.length === 0) throw new ResolutionError("apify_empty_post");
 
-  return { caption, images, author_handle, posted_at };
+  return { caption, images, author_handle, posted_at, is_carousel };
 }
 
 // ── TikTok (oEmbed) ────────────────────────────────────────────────────────
@@ -187,47 +206,143 @@ async function resolveTikTok(url: string, signal: AbortSignal): Promise<Resolved
   return { caption, images, author_handle };
 }
 
-// ── Entry point ────────────────────────────────────────────────────────────
+// ── Sociavault (Instagram, PRIMARY) ──────────────────────────────────────────
+
+// The SociaVault response nests media at data.data.xdt_shortcode_media (with a
+// data.xdt_shortcode_media fallback for safety). Note: edge_sidecar_to_children
+// .edges is an OBJECT MAP ({"0":…,"1":…}), not an array — use Object.values.
+type SVMedia = {
+  edge_media_to_caption?: { edges?: Record<string, { node?: { text?: string } }> };
+  owner?: { username?: string };
+  taken_at_timestamp?: number;
+  display_url?: string;
+  edge_sidecar_to_children?: { edges?: Record<string, { node?: { display_url?: string } }> };
+};
+
+function collectSociavaultImageUrls(media: SVMedia): string[] {
+  const sidecar = media.edge_sidecar_to_children;
+  if (sidecar?.edges) {
+    // Includes video children — their display_url is the thumbnail.
+    return Object.values(sidecar.edges)
+      .map((e) => e?.node?.display_url)
+      .filter((u): u is string => typeof u === "string" && u.startsWith("http"));
+  }
+  return typeof media.display_url === "string" ? [media.display_url] : [];
+}
+
+async function resolveSociavault(url: string): Promise<ResolvedPost> {
+  const key = process.env.SOCIAVAULT_API_KEY;
+  if (!key) throw new ResolutionError("sociavault_key_missing");
+
+  const signal = AbortSignal.timeout(SOCIAVAULT_TIMEOUT_MS); // 8s, no retry
+  const endpoint = `${SOCIAVAULT_ENDPOINT}?url=${encodeURIComponent(url)}`;
+  const res = await fetch(endpoint, { headers: { "X-API-Key": key }, signal });
+  if (!res.ok) throw new ResolutionError(`sociavault_http_${res.status}`);
+
+  const json = (await res.json()) as {
+    data?: { data?: { xdt_shortcode_media?: SVMedia }; xdt_shortcode_media?: SVMedia };
+  };
+  const media = json.data?.data?.xdt_shortcode_media ?? json.data?.xdt_shortcode_media;
+  if (!media) throw new ResolutionError("sociavault_no_media");
+
+  // Caption may be absent → empty string. (edges may be an object map; [0] works.)
+  const captionEdges = media.edge_media_to_caption?.edges;
+  const caption =
+    (captionEdges && (Object.values(captionEdges)[0]?.node?.text ?? "")) || "";
+
+  const username = media.owner?.username;
+  const author_handle = typeof username === "string" && username ? `@${username}` : "";
+
+  const ts = media.taken_at_timestamp;
+  const posted_at = typeof ts === "number" ? new Date(ts * 1000).toISOString() : undefined;
+
+  const is_carousel = !!media.edge_sidecar_to_children?.edges;
+  const images = await fetchImages(collectSociavaultImageUrls(media), signal);
+
+  if (!caption && images.length === 0) throw new ResolutionError("sociavault_empty_post");
+
+  return { caption, images, author_handle, posted_at, is_carousel, driver: "sociavault" };
+}
+
+// ── Apify (Instagram, FALLBACK) ──────────────────────────────────────────────
 
 /** AbortSignal.timeout aborts with a TimeoutError; older runtimes use AbortError. */
 function isTimeout(e: unknown): boolean {
   return e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
 }
 
-async function resolveOnce(url: string, signal: AbortSignal): Promise<ResolvedPost> {
-  switch (detectPlatform(url)) {
-    case "instagram":
-      return resolveInstagram(url, signal);
-    case "tiktok":
-      return resolveTikTok(url, signal);
-    default:
-      throw new ResolutionError("unsupported_platform");
+/** Apify driver: 25s per attempt + one retry on timeout. */
+async function resolveApify(url: string): Promise<ResolvedPost> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const signal = AbortSignal.timeout(RESOLUTION_TIMEOUT_MS);
+    try {
+      const post = await apifyInstagram(url, signal);
+      return { ...post, driver: "apify" };
+    } catch (e) {
+      lastError = e;
+      if (e instanceof ResolutionError) throw e; // deterministic → don't retry
+      if (isTimeout(e)) continue; // retry only on timeout
+      throw new ResolutionError("resolution_failed");
+    }
+  }
+  throw new ResolutionError(
+    isTimeout(lastError) ? "resolution_timeout" : "resolution_failed",
+  );
+}
+
+// ── Driver chain + entry point ───────────────────────────────────────────────
+
+/** Instagram driver order, env-configurable (RESOLVE_DRIVER_ORDER). */
+function driverOrder(): Array<"sociavault" | "apify"> {
+  const raw = (process.env.RESOLVE_DRIVER_ORDER || "sociavault,apify").toLowerCase();
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((d): d is "sociavault" | "apify" => d === "sociavault" || d === "apify");
+  return parsed.length ? parsed : ["sociavault", "apify"];
+}
+
+/** Try each Instagram driver in order; first success wins, failures fall through. */
+async function resolveInstagram(url: string): Promise<ResolvedPost> {
+  let lastError: unknown;
+  for (const driver of driverOrder()) {
+    try {
+      return driver === "sociavault"
+        ? await resolveSociavault(url)
+        : await resolveApify(url);
+    } catch (e) {
+      lastError = e; // fall through to the next driver
+    }
+  }
+  throw lastError instanceof ResolutionError
+    ? lastError
+    : new ResolutionError("resolution_failed");
+}
+
+async function resolveTikTokDriver(url: string): Promise<ResolvedPost> {
+  const signal = AbortSignal.timeout(SOCIAVAULT_TIMEOUT_MS); // 8s
+  try {
+    const post = await resolveTikTok(url, signal);
+    return { ...post, driver: "tiktok-oembed" };
+  } catch (e) {
+    if (e instanceof ResolutionError) throw e;
+    throw new ResolutionError("resolution_failed");
   }
 }
 
 /**
- * Resolve a post URL to caption + images + author. Each attempt gets a fresh 25s
- * budget; on a *timeout* it retries once (explicit failures like empty posts or
- * HTTP errors are not retried). Throws ResolutionError on final failure → the
- * route returns 422 and the frontend shows the screenshot-paste fallback.
+ * Resolve a post URL to caption + images + author. Instagram runs the driver
+ * chain (SociaVault primary → Apify fallback). Throws ResolutionError on total
+ * failure → the route returns 422 and the frontend shows the paste fallback.
  */
 export async function resolve(url: string): Promise<ResolvedPost> {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const signal = AbortSignal.timeout(RESOLUTION_TIMEOUT_MS);
-    try {
-      return await resolveOnce(url, signal);
-    } catch (e) {
-      lastError = e;
-      // Explicit, deterministic failures — retrying won't help.
-      if (e instanceof ResolutionError) throw e;
-      // Retry only on timeout, and only if attempts remain.
-      if (isTimeout(e)) continue;
-      // Other network error — not retryable.
-      throw new ResolutionError("resolution_failed");
-    }
+  switch (detectPlatform(url)) {
+    case "instagram":
+      return resolveInstagram(url);
+    case "tiktok":
+      return resolveTikTokDriver(url);
+    default:
+      throw new ResolutionError("unsupported_platform");
   }
-
-  throw new ResolutionError(isTimeout(lastError) ? "resolution_timeout" : "resolution_failed");
 }

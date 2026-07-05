@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExtractResponse, Item } from "@/lib/types";
-import { icsDataUri, googleCalUrl, type CalItem } from "@/lib/calendar";
+import { icsHref, googleCalUrl, type CalItem } from "@/lib/calendar";
 
 type Stage = "idle" | "resolving" | "extracting" | "results" | "error";
 
@@ -19,6 +19,7 @@ interface ResolveResult {
   images: Array<{ data: string; media_type: string }>;
   author_handle: string;
   posted_at: string | null;
+  is_carousel: boolean;
 }
 
 // ── time / tz helpers ────────────────────────────────────────────────────────
@@ -260,6 +261,7 @@ export default function Home() {
         await runExtract({
           caption: resolved.caption,
           images: resolved.images,
+          is_carousel: resolved.is_carousel,
           author_handle: resolved.author_handle,
           posted_at: resolved.posted_at ?? undefined,
         });
@@ -726,8 +728,7 @@ function CardView({
       {showCalendar ? (
         <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
           <a
-            href={icsDataUri(cal)}
-            download={`${(c.title || "event").replace(/[^\w -]+/g, "").slice(0, 40) || "event"}.ics`}
+            href={icsHref(cal)}
             style={{
               flex: 1,
               textAlign: "center",
@@ -740,7 +741,7 @@ function CardView({
               fontSize: 15,
             }}
           >
-            Add to Calendar (.ics)
+            Apple Calendar
           </a>
           <a
             href={googleCalUrl(cal)}

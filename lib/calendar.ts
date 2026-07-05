@@ -122,12 +122,55 @@ export function buildICS(item: CalItem): string {
   return lines.map(fold).join("\r\n");
 }
 
+/** Field order used to (de)serialize a CalItem to/from GET /api/ics query params. */
+const ICS_PARAM_KEYS = [
+  "title",
+  "location",
+  "notes",
+  "offset",
+  "dateStart",
+  "dateEnd",
+  "timeStart",
+  "timeEnd",
+  "reminderLocal",
+  "reminderLabel",
+] as const;
+
+/** Serialize a CalItem into a query string for GET /api/ics. */
+export function icsQuery(item: CalItem): string {
+  const p = new URLSearchParams();
+  for (const k of ICS_PARAM_KEYS) p.set(k, item[k]);
+  p.set("allDay", item.allDay ? "1" : "0");
+  p.set("isDateRange", item.isDateRange ? "1" : "0");
+  return p.toString();
+}
+
+/** Reconstruct a CalItem from GET /api/ics query params. */
+export function calItemFromParams(sp: URLSearchParams): CalItem {
+  const s = (k: string) => sp.get(k) ?? "";
+  return {
+    title: s("title") || "Event",
+    location: s("location"),
+    notes: s("notes"),
+    allDay: sp.get("allDay") === "1",
+    isDateRange: sp.get("isDateRange") === "1",
+    offset: s("offset") || "Z",
+    dateStart: s("dateStart"),
+    dateEnd: s("dateEnd"),
+    timeStart: s("timeStart"),
+    timeEnd: s("timeEnd"),
+    reminderLocal: s("reminderLocal"),
+    reminderLabel: s("reminderLabel"),
+  };
+}
+
 /**
- * A `data:` URI for the .ics. Rendered as the href of a real <a download>, which
- * is the reliable "add to calendar" path on iOS Safari (a native tap → Calendar).
+ * Link to the server-side .ics endpoint. Using a real HTTPS URL that returns
+ * `text/calendar` inline (not a `data:` URI) is what makes iOS Safari open the
+ * event in Calendar instead of saving the file to Files.
  */
-export function icsDataUri(item: CalItem): string {
-  return "data:text/calendar;charset=utf-8," + encodeURIComponent(buildICS(item));
+export function icsHref(item: CalItem): string {
+  return `/api/ics?${icsQuery(item)}`;
 }
 
 // ── Google Calendar link ─────────────────────────────────────────────────────

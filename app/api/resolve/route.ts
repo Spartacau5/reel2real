@@ -40,6 +40,8 @@ export async function POST(req: Request) {
         images,
         author_handle: resolved.author_handle,
         posted_at: resolved.posted_at ?? null,
+        is_carousel: resolved.is_carousel ?? false,
+        driver: resolved.driver ?? null,
       },
       { status: 200 },
     );
